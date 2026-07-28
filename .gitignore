@@ -1,0 +1,5 @@
+oj/
+*.so
+ojfuzz
+corpus/
+artifacts/
