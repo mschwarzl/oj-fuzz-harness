@@ -20,12 +20,10 @@ All 7 reproduced by the maintainer on `develop`; PRs #1062-#1067
   `Rake::TestTask` is commented out and `test_all`'s invoke resolves to the
   `test` directory as a synthesized file task.
 
-## Found after those fixes
+## Found after those fixes -- reported: oj_set_error_at
 
 **Stack-buffer-overflow WRITE in `oj_set_error_at` (`ext/oj/parse.c`).**
 Found against `develop` *after* #1062-#1064 merged, by the rebuilt harness.
-Reported in [a follow-up comment on #1059](https://github.com/ohler55/oj/issues/1059#issuecomment-5108741540);
-still reproduces at `1f826128`.
 
 ```
 WRITE of size 1
@@ -57,6 +55,13 @@ Oj.load(StringIO.new(%({"^u":["#{"A" * n}",1]})), mode: :object)
 Outside 224-227 it raises `ArgumentError` cleanly. Note the single bracket:
 `[["a"],1]` takes the anonymous-struct path and does *not* reach
 `oj_name2struct`.
+
+**Two callers, because `resolve_classpath` is duplicated** (`intern.c:204` and
+`resolve.c:33`). Reported the `resolve.c`/`^u` one first; the longer campaign
+found `^c` -> `hat_cstr` -> `oj_class_intern` -> `resolve_classpath`
+(`intern.c:238`), which needs no StringIO and no Struct and is the more
+reachable path. Corrected in issue comment 5108857339. Fixing the call sites
+rather than `oj_set_error_at` itself would leave one of them.
 
 Reachable from any `Oj.load` in `:object` mode, String or IO, whenever a
 `^u`/`^o`/`^c` class name is long enough to push the formatted message into that
