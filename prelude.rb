@@ -97,10 +97,44 @@ def objs(s)
   ]
   o << FZ_DATA.new(s, 1) if FZ_DATA
   o << OpenStruct.new(a: s) if HAVE_OSTRUCT
+  o.concat(as_objs(t)) if HAVE_AS
   o
 end
 
+# rails.c dispatches on the ActiveSupport classes by name, so these are the only
+# way into dump_timewithzone, dump_bigdecimal, dump_as_json and dump_to_s.
+# dump_activerecord and dump_actioncontroller_parameters additionally need
+# activerecord and actionpack, which are not installed.
+def as_objs(t)
+  [
+    Time.now.in_time_zone("UTC"),
+    Time.now.in_time_zone("Asia/Tokyo"),
+    ActiveSupport::Duration.build(3661),
+    ActiveSupport::TimeZone["UTC"],
+    { "a" => t }.with_indifferent_access,
+    ActiveSupport::SafeBuffer.new(t),
+    Date.today.in_time_zone,
+  ]
+rescue StandardError
+  []
+end
+
 def pick(s, i) = objs(s)[i % objs(s).size]
+
+# Dump the sample objects one at a time. Dumping the array in one call means a
+# single object that raises (ActiveSupport 8.1 patches DateTime#as_json to call
+# a super that does not exist on Ruby 4.0, once optimize_rails is on) aborts the
+# whole dump and costs coverage for every other object in the list.
+def dump_all(list, opts)
+  list.map { |o| Oj.dump(o, opts) rescue nil }
+end
+
+def roundtrip_all(list, opts)
+  list.map do |o|
+    d = Oj.dump(o, opts) rescue next
+    Oj.load(d, opts) rescue nil
+  end
+end
 
 def to_file(s)
   File.binwrite(FZ_FILE, s)
@@ -154,6 +188,11 @@ HAVE_AS = begin
 rescue LoadError, StandardError
   false
 end
+
+# Oj::Rails.mimic_JSON is a second global switch, separate from Oj.mimic_JSON.
+# It is the only way into rails_mimic_json / oj_mimic_rails_init /
+# rails_set_encoder / rails_set_decoder.
+Oj::Rails.mimic_JSON if HAVE_AS && Oj::Rails.respond_to?(:mimic_JSON)
 
 HAVE_RAILS_ENC = defined?(Oj::Rails::Encoder) ? true : false
 
@@ -244,46 +283,72 @@ TARGETS = [
     next unless HAVE_RAILS_ENC
 
     n = s.getbyte(0) || 0
-    Oj::Rails::Encoder.new(indent: n & 7, circular: n[3] == 1).encode(pick(s, n))
+    Oj::Rails::Encoder.new(indent: " " * (n & 7), circular: n[3] == 1).encode(pick(s, n))
   },
   ->(s) { Oj.dump(pick(s, s.getbyte(0) || 0), mode: :rails) },
-  ->(s) { Oj.dump(objs(s), mode: :rails, indent: "  ") },
+  ->(s) { dump_all(objs(s), mode: :rails, indent: "  ") },
   ->(s) {
     if Oj::Rails.respond_to?(:use_standard_json_time_format)
       Oj::Rails.use_standard_json_time_format(s.getbyte(0).to_i.even?)
       Oj::Rails.escape_html_entities_in_json(s.getbyte(1).to_i.even?)
       Oj::Rails.time_precision = (s.getbyte(2) || 0) & 15
     end
-    Oj.dump(objs(s), mode: :rails)
+    dump_all(objs(s), mode: :rails)
   },
-  ->(s) { next unless HAVE_AS; Oj::Rails.optimize; Oj.dump(pick(s, s.getbyte(0) || 0), mode: :rails) },
+  ->(s) { next unless HAVE_AS; (Oj::Rails.optimize(Hash) rescue nil); Oj.dump(pick(s, s.getbyte(0) || 0), mode: :rails) },
+  ->(s) {
+    # encoder_optimize / encoder_deoptimize / encoder_optimized, which are
+    # methods on the encoder instance rather than the module.
+    next unless HAVE_RAILS_ENC
+
+    e = Oj::Rails::Encoder.new(indent: " " * ((s.getbyte(0) || 0) & 7))
+    (e.optimize(Hash, Array, FzObj) if e.respond_to?(:optimize)) rescue nil
+    r = e.encode(pick(s, s.getbyte(1) || 0))
+    (e.optimized?(Hash) if e.respond_to?(:optimized?)) rescue nil
+    (e.deoptimize(FzObj) if e.respond_to?(:deoptimize)) rescue nil
+    r
+  },
   ->(s) {
     next unless HAVE_AS
 
-    Oj::Rails.deoptimize
+    # Oj::Rails.optimize references ActiveRecord internally, so without
+    # activerecord installed these raise NameError before reaching rails.c.
+    begin
+      Oj::Rails.optimized?(Hash) if Oj::Rails.respond_to?(:optimized?)
+      Oj::Rails.optimize(Hash, Array)
+      Oj::Rails.deoptimize(FzObj)
+    rescue NameError
+      nil
+    end
+    dump_all(objs(s), mode: :rails)
+  },
+  ->(s) {
+    next unless HAVE_AS
+
+    (Oj::Rails.deoptimize(Hash) rescue nil)
     r = Oj.dump(pick(s, 0), mode: :rails)
-    Oj::Rails.optimize
+    (Oj::Rails.optimize(Hash) rescue nil)
     r
   },
 
   # --- custom.c: the *_dump / *_load pairs ---
   ->(s) { Oj.dump(pick(s, s.getbyte(0) || 0), mode: :custom) },
-  ->(s) { Oj.dump(objs(s), mode: :custom, indent: "  ", create_id: "^o") },
-  ->(s) { Oj.load(Oj.dump(objs(s), mode: :custom), mode: :custom) },
+  ->(s) { dump_all(objs(s), mode: :custom, indent: "  ", create_id: "^o") },
+  ->(s) { roundtrip_all(objs(s), mode: :custom) },
   ->(s) { Oj.load(s, mode: :custom, create_additions: true) },
   ->(s) { Oj.dump(FzOdd.new(s), mode: :custom) },   # odd.c
 
   # --- dump_compat.c ---
   ->(s) { Oj.dump(pick(s, s.getbyte(0) || 0), mode: :compat) },
-  ->(s) { Oj.dump(objs(s), mode: :compat, indent: "  ") },
-  ->(s) { Oj.load(Oj.dump(objs(s), mode: :compat), mode: :compat) },
+  ->(s) { dump_all(objs(s), mode: :compat, indent: "  ") },
+  ->(s) { roundtrip_all(objs(s), mode: :compat) },
 
   # --- dump*.c generally, driven by an option byte ---
   ->(s) { Oj.dump(s, mode: :rails) },
   ->(s) { Oj.dump({ "k" => s, s => "v", "a" => [s, { s => s }] }, mode: :rails) },
-  ->(s) { Oj.dump(objs(s), dump_opts(s.getbyte(0) || 0)) },
+  ->(s) { dump_all(objs(s), dump_opts(s.getbyte(0) || 0)) },
   ->(s) { Oj.dump(s, mode: :rails, escape_mode: :xss_safe) },
-  ->(s) { Oj.to_file(FZ_FILE, objs(s), mode: :object) },
+  ->(s) { objs(s).each { |o| Oj.to_file(FZ_FILE, o, mode: :object) rescue nil } },
 
   # --- string_writer.c / stream_writer.c ---
   ->(s) {
