@@ -114,6 +114,17 @@ def as_objs(t)
     { "a" => t }.with_indifferent_access,
     ActiveSupport::SafeBuffer.new(t),
     Date.today.in_time_zone,
+  ].concat(ar_objs(t))
+rescue StandardError
+  []
+end
+
+def ar_objs(t)
+  return [] unless HAVE_AR
+
+  [
+    ActiveRecord::Result.new(%w[a b], [[1, t], [nil, 2.5]]),
+    ActionController::Parameters.new({ "a" => t, "n" => [1, { "k" => t }] }),
   ]
 rescue StandardError
   []
@@ -184,6 +195,22 @@ HAVE_AS = begin
   require "active_support/time"
   require "oj/active_support_helper"
   Oj.optimize_rails
+  true
+rescue LoadError, StandardError
+  false
+end
+
+# dump_activerecord_result and dump_actioncontroller_parameters dispatch on
+# these concrete classes, and Oj::Rails.optimize references ActiveRecord
+# internally, so the encoder_optimize / rails_optimize paths need them too.
+# Both classes construct standalone; no database connection is involved.
+HAVE_AR = begin
+  require "active_record"
+  require "action_controller"
+  # dump_activerecord_result and dump_actioncontroller_parameters are only
+  # reached once these specific classes are registered as optimized; a bare
+  # Oj.dump of them goes through the generic as_json path instead.
+  Oj::Rails.optimize(ActiveRecord::Result, ActionController::Parameters)
   true
 rescue LoadError, StandardError
   false
