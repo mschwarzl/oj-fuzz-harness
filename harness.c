@@ -6,6 +6,9 @@
 // bugs existed in one while the sibling had the guard (saj.c read_hash vs
 // fast.c, parse.c klen vs usual.c).
 //
+// The target table lives in prelude.rb, pointed at by OJ_PRELUDE, so adding an
+// entry point is an edit rather than a rebuild.
+//
 // Build:
 //   cd oj/ext/oj && ruby extconf.rb
 //   make CC=clang LDSHARED="clang -shared" \
@@ -16,10 +19,10 @@
 //         harness.c -o ojfuzz $(pkg-config --libs ruby-3.4) -rdynamic
 //
 // Run:
-//   OJ_SHIM=$PWD/shim OJ_LIB=$PWD/oj/lib \
+//   OJ_SHIM=$PWD/shim OJ_LIB=$PWD/oj/lib OJ_PRELUDE=$PWD/prelude.rb \
 //   ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 \
 //   ./ojfuzz corpus -dict=json.dict -max_len=262144 -use_value_profile=1 \
-//            -artifact_prefix=artifacts/ -jobs=4 -workers=4
+//            -artifact_prefix=artifacts/ -fork=14 -ignore_crashes=1
 //
 // Notes:
 //   * ASAN and Ruby's threaded fiber pool are incompatible ("failed to
@@ -57,64 +60,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv) {
     int st = 0;
     rb_eval_string_protect(
         "$LOAD_PATH.unshift(ENV.fetch('OJ_SHIM'), ENV.fetch('OJ_LIB'))\n"
-        "require 'oj'\n"
-        "require 'stringio'\n"
-        "LIM = { max_array_size: 50_000, max_hash_size: 50_000,\n"
-        "        max_depth: 32, max_total_elements: 100_000 }\n"
-        "class NullSaj < Oj::Saj\n"
-        "  def hash_start(*) = nil\n"
-        "  def hash_end(*) = nil\n"
-        "  def array_start(*) = nil\n"
-        "  def array_end(*) = nil\n"
-        "  def add_value(*) = nil\n"
-        "  def hash_key(*) = nil\n"
-        "  def hash_set(*) = nil\n"
-        "  def array_append(*) = nil\n"
-        "  def error(*) = nil\n"
-        "end\n"
-        "H     = NullSaj.new\n"
-        "USUAL = Oj::Parser.usual\n"
-        "SAFE  = Oj::Parser.safe(LIM)\n"
-        "SAJ2  = Oj::Parser.new(:saj); SAJ2.handler = H\n"
-        "def wrap(s) = { 'k' => s, s => 'v', 'a' => [s, { s => s }] }\n"
-        "TARGETS = [\n"
-        /* --- Oj::Parser family: parser.c / usual.c / safe.c / saj2.c --- */
-        "  ->(s) { USUAL.parse(s) },\n"
-        "  ->(s) { SAFE.parse(s) },\n"
-        "  ->(s) { SAJ2.parse(s) },\n"
-        /* --- legacy string parser: parse.c, every mode --- */
-        "  ->(s) { Oj.load(s, mode: :strict) },\n"
-        "  ->(s) { Oj.load(s, mode: :compat) },\n"
-        "  ->(s) { Oj.load(s, mode: :object) },\n"
-        "  ->(s) { Oj.load(s, mode: :custom) },\n"
-        "  ->(s) { Oj.load(s, mode: :rails) },\n"
-        "  ->(s) { Oj.load(s, mode: :wab) },\n"
-        /* --- object mode with circular refs: circarray.c, object.c hat_* --- */
-        "  ->(s) { Oj.load(s, mode: :object, circular: true) },\n"
-        /* --- streaming parser: sparse.c (needs an IO, not a String) --- */
-        "  ->(s) { Oj.load(StringIO.new(s), mode: :strict) },\n"
-        "  ->(s) { Oj.load(StringIO.new(s), mode: :compat) },\n"
-        "  ->(s) { Oj.load(StringIO.new(s), mode: :object) },\n"
-        "  ->(s) { Oj.load(StringIO.new(s), mode: :rails) },\n"
-        /* --- SAX/callback: scp.c over parse.c and sparse.c --- */
-        "  ->(s) { Oj.sc_parse(H, s) },\n"
-        "  ->(s) { Oj.sc_parse(H, StringIO.new(s)) },\n"
-        /* --- old SAJ parser: saj.c --- */
-        "  ->(s) { Oj.saj_parse(H, s) },\n"
-        "  ->(s) { Oj.saj_parse(H, StringIO.new(s)) },\n"
-        /* --- DOM parser: fast.c --- */
-        "  ->(s) { Oj::Doc.open(s) { |d| d.size; d.each_leaf { |x| } } },\n"
-        "  ->(s) { Oj::Doc.open(s) { |d| d.dump } },\n"
-        /* --- serialization: dump*.c, with attacker bytes inside the object --- */
-        "  ->(s) { Oj.dump(s, mode: :rails) },\n"
-        "  ->(s) { Oj.dump(wrap(s), mode: :rails) },\n"
-        "  ->(s) { Oj.dump(wrap(s), mode: :compat, indent: 2) },\n"
-        "  ->(s) { Oj.dump(s, mode: :rails, escape_mode: :xss_safe) },\n"
-        "  ->(s) { io = StringIO.new; w = Oj::StreamWriter.new(io, indent: 2);\n"
-        "          w.push_object; w.push_value(s, 'k'); w.pop_all },\n"
-        /* --- round trip --- */
-        "  ->(s) { Oj.dump(Oj.load(s, mode: :strict), mode: :strict) },\n"
-        "]\n", &st);
+        "load ENV.fetch('OJ_PRELUDE')\n", &st);
     if (st) {
         VALUE e = rb_errinfo();
         VALUE m = rb_funcall(e, rb_intern("message"), 0);

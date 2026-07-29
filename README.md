@@ -48,7 +48,7 @@ Adjust `ruby-3.4` to your `pkg-config` name.
 ```bash
 mkdir -p corpus artifacts
 ruby gen_corpus.rb          # writes the structural seeds
-OJ_SHIM="$PWD/shim" OJ_LIB="$PWD/oj/lib" \
+OJ_SHIM="$PWD/shim" OJ_LIB="$PWD/oj/lib" OJ_PRELUDE="$PWD/prelude.rb" \
 ASAN_OPTIONS=detect_leaks=0:abort_on_error=0:allocator_may_return_null=1 \
 ./ojfuzz corpus -dict=json.dict -max_len=262144 -use_value_profile=1 \
          -artifact_prefix=artifacts/ -jobs=4 -workers=4
@@ -93,15 +93,38 @@ cluster:
 * truncations where a key or value is expected but input ends
 * exponents at 4932/32768/327683 and surrogate escapes
 
+## Targets
+
+The target table lives in `prelude.rb`, not in `harness.c`, so adding an entry
+point is an edit rather than a rebuild. 69 targets covering the parsers, the
+`Oj::Parser` family, `Oj::Doc`, the writers, mimic_JSON, and the rails, custom
+and compat dump paths.
+
+Pick targets against `-print_coverage=1`, not intuition. The first table had 26
+entries and reached 289/702 `ext/oj` functions; `rails.c` and `mimic_json.c`
+were at zero because nothing ever called `Oj.mimic_JSON` or the Rails encoder.
+Adding targets for the uncovered names took it to 415/703, 59.0%.
+
+Two things that silently cost coverage:
+
+* `Oj.mimic_JSON` switches `:indent` process-wide to JSON's String semantics,
+  so `indent: 2` raises `TypeError` afterwards. Pass a String.
+* Arbitrary fuzz bytes cannot build a `Regexp` or a `Symbol`. Scrub to UTF-8
+  before constructing sample objects, or every dump target using them raises
+  before Oj is reached and the whole subsystem stays dark.
+
 ## Status
 
 Findings 1-7 from [issue #1059](https://github.com/ohler55/oj/issues/1059) are
-fixed or have PRs (#1062-#1067). Verified against `develop` at `1f826128`: all
-seven now either pass or raise a clean `Oj::ParseError`.
+merged (#1062-#1067), as is the `oj_set_error_at` stack-buffer-overflow write
+found afterwards (#1071).
 
-`crashes/` holds one artifact found against `develop` *after* those fixes: a
-stack-buffer-overflow **write** in `oj_set_error_at` (`parse.c`), reached via
-`resolve_classpath` from the `^u` Struct directive. The guard is
-`if (p + 3 < end)` but the body then writes 8 bytes. Reported in
-[a follow-up comment](https://github.com/ohler55/oj/issues/1059#issuecomment-5108741540);
-still reproduces at `1f826128` and no open PR touches that function.
+Current finding, reported and not yet fixed: `Oj::Parser#file` never calls
+`validate_document_end()`, so a truncated document is never diagnosed and
+`p->result(p)` returns an uninitialized `VALUE`.
+
+```ruby
+File.binwrite('/tmp/t.json', '{"a":')
+Oj::Parser.usual.file('/tmp/t.json')   # => 286326800, then SEGV
+Oj::Parser.usual.parse('{"a":')        # => EncodingError, correct
+```
