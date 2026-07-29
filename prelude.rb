@@ -39,7 +39,25 @@ class NullSaj < Oj::Saj
   def error(*) = nil
 end
 
-H = NullSaj.new
+# saj2.c picks its callbacks by ARITY, not by which methods exist:
+# arity 1 on hash_start/hash_end/array_start/array_end and arity 2 on add_value
+# select the plain variants, anything else selects the _loc ones. NullSaj uses
+# (*) splats, arity -1, so it only ever exercised the _loc half of the file.
+class PlainSaj
+  def hash_start(key) = nil
+  def hash_end(key) = nil
+  def array_start(key) = nil
+  def array_end(key) = nil
+  def add_value(value, key) = nil
+end
+
+# Responds to none of the callbacks, which leaves every slot on saj2.c's noop.
+class EmptySaj
+end
+
+H       = NullSaj.new
+H_PLAIN = PlainSaj.new
+H_EMPTY = EmptySaj.new
 LIM = { max_array_size: 50_000, max_hash_size: 50_000,
         max_depth: 32, max_total_elements: 100_000 }.freeze
 
@@ -406,6 +424,75 @@ TARGETS = [
     w.pop
     w.pop_all
   },
+
+  # --- saj2.c plain (non-_loc) callbacks, reached only via arity ---
+  ->(s) { p = Oj::Parser.new(:saj); p.handler = H_PLAIN; p.parse(s) },
+  ->(s) { p = Oj::Parser.new(:saj); p.handler = H_PLAIN; p.file(to_file(s)) },
+  ->(s) { p = Oj::Parser.new(:saj); p.handler = H_EMPTY; p.parse(s) },
+
+  # --- dump_compat.c *_alt dumpers, active only under Oj.add_to_json ---
+  ->(s) {
+    Oj.add_to_json(BigDecimal, Complex, Date, DateTime, Range, Rational, Regexp, Time)
+    r = dump_all(objs(s), mode: :compat)
+    Oj.remove_to_json(BigDecimal, Complex, Date, DateTime, Range, Rational, Regexp, Time)
+    r
+  },
+  ->(s) {
+    Oj.add_to_json(Object)
+    r = dump_all(objs(s), mode: :compat, create_id: "^o", class_cache: true)
+    Oj.remove_to_json(Object)
+    r
+  },
+  # dump_float / dump_bignum want values the fast paths do not handle
+  ->(s) {
+    n = s.getbyte(0) || 0
+    vals = [Float::INFINITY, -Float::INFINITY, Float::NAN, 1e308 * 10,
+            2**(64 + (n & 63)), -(2**(96 + (n & 31))), 1.0 / 3, 1e-320]
+    dump_all(vals, mode: :compat) + dump_all(vals, mode: :rails)
+  },
+
+  # --- usual.c option getters/setters (the opt_* family) ---
+  ->(s) {
+    n = s.getbyte(0) || 0
+    p = Oj::Parser.new(:usual)
+    p.cache_keys = n[0] == 1
+    p.cache_strings = (n >> 1) & 3
+    p.cache_expunge = (n >> 3) & 3
+    p.capacity = ((n >> 4) & 3) * 256
+    p.symbol_keys = n[2] == 1
+    p.class_cache = n[5] == 1
+    p.create_id = n[6] == 1 ? "^o" : nil
+    p.ignore_json_create = n[7] == 1
+    p.omit_null = n[1] == 1
+    p.array_class = n[4] == 1 ? Array : nil
+    p.hash_class = n[3] == 1 ? Hash : nil
+    p.missing_class = n[0] == 1 ? :auto : :ignore
+    p.raise_on_empty = n[5] == 1
+    # read every one back: the getters are separate functions
+    [p.cache_keys, p.cache_strings, p.cache_expunge, p.capacity, p.symbol_keys,
+     p.class_cache, p.create_id, p.ignore_json_create, p.omit_null,
+     p.array_class, p.hash_class, p.missing_class, p.raise_on_empty]
+    p.parse(s)
+  },
+
+  # --- custom.c *_load: needs documents that custom dump produced ---
+  ->(s) {
+    d = Oj.dump(objs(s), mode: :custom, create_id: "^o", create_additions: true) rescue nil
+    d && Oj.load(d, mode: :custom, create_additions: true)
+  },
+  ->(s) { Oj.load(s, mode: :custom, create_additions: true, create_id: "^o") },
+  ->(s) { roundtrip_all(objs(s), mode: :custom, create_id: "^o", create_additions: true) },
+
+  # --- oj.c entry points ---
+  ->(s) { io = StringIO.new; Oj.to_stream(io, objs(s), mode: :compat); io.string.bytesize },
+  ->(s) {
+    o = Oj.default_options
+    Oj.default_options = { mode: %i[strict compat object custom rails][(s.getbyte(0) || 0) % 5] }
+    r = Oj.dump(s)
+    Oj.default_options = o
+    r
+  },
+  ->(s) { Oj.to_json(pick(s, s.getbyte(0) || 0)) },
 
   # --- round trips ---
   ->(s) { Oj.dump(Oj.load(s, mode: :strict), mode: :strict) },
