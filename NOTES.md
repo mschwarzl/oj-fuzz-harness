@@ -20,7 +20,7 @@ All 7 reproduced by the maintainer on `develop`; PRs #1062-#1067
   `Rake::TestTask` is commented out and `test_all`'s invoke resolves to the
   `test` directory as a synthesized file task.
 
-## Found after those fixes -- reported: oj_set_error_at
+## Reported follow-up: oj_set_error_at
 
 **Stack-buffer-overflow WRITE in `oj_set_error_at` (`ext/oj/parse.c`).**
 Found against `develop` *after* #1062-#1064 merged, by the rebuilt harness.
