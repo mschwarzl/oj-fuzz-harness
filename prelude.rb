@@ -81,6 +81,12 @@ class FzObj
   def as_json(*) = { "fz" => @n }
 end
 
+# An object exposing raw_json reaches oj_dump_raw_json.
+class FzRaw
+  def initialize(s) = @s = s
+  def raw_json(_depth = 0, _indent = 0) = %({"raw":#{@s.bytesize}})
+end
+
 # Oj.register_odd needs a class with a named dump method (odd.c).
 class FzOdd
   attr_reader :v
@@ -165,6 +171,17 @@ def roundtrip_all(list, opts)
   end
 end
 
+# debug.c and the trace hooks print with libc printf(). A Ruby-level redirect
+# cannot reach that FILE buffer -- the output just sits there and flushes to
+# whatever fd 1 is when the buffer fills or the process exits. run.sh therefore
+# points fd 1 at /dev/null for the whole process; libFuzzer writes progress and
+# -print_coverage to stderr, so nothing useful is lost.
+#
+# Deliberately NOT silencing stderr here: that is where ASAN reports go.
+def silenced
+  yield
+end
+
 def to_file(s)
   File.binwrite(FZ_FILE, s)
   FZ_FILE
@@ -201,7 +218,21 @@ end
 # Note this changes the meaning of the :indent option process-wide: JSON's
 # indent is a String, so `indent: 2` raises TypeError from here on. Every dump
 # target below passes a String.
-Oj.mimic_JSON
+# PROFILE SPLIT.
+#
+# Oj.optimize_rails installs a global encoder that diverts custom-mode dumps of
+# Time and Date away from custom.c into rails.c:
+#
+#   plain:     Oj.dump(Time.at(0), mode: :custom) => {"^o":"Time","time":0.0}
+#   optimized: Oj.dump(Time.at(0), mode: :custom) => "1970-01-01T01:00:00.000+01:00"
+#
+# So custom.c's time_dump/date_dump/*_load family and rails.c/mimic_json.c can
+# never be covered by the same process. OJ_PROFILE=mimic turns the global
+# switches on; anything else leaves them off. Run a campaign of each and union
+# the coverage.
+MIMIC = ENV.fetch("OJ_PROFILE", "plain") == "mimic"
+
+Oj.mimic_JSON if MIMIC
 
 # Most of rails.c is only reachable with ActiveSupport loaded: optimize_rails
 # raises "ActiveSupport not loaded" without it, and the dump_activerecord /
@@ -209,6 +240,8 @@ Oj.mimic_JSON
 # classes. Oj::Rails::Encoder and the standalone setters still work, so cover
 # what is reachable and skip the rest rather than failing to load.
 HAVE_AS = begin
+  raise LoadError unless MIMIC
+
   require "active_support"
   require "active_support/time"
   require "oj/active_support_helper"
@@ -493,6 +526,166 @@ TARGETS = [
     r
   },
   ->(s) { Oj.to_json(pick(s, s.getbyte(0) || 0)) },
+
+  # --- debug.c: an entire parser mode that was never instantiated ---
+  ->(s) { silenced { Oj::Parser.new(:debug).parse(s) } },
+  ->(s) { silenced { Oj::Parser.new(:debug).file(to_file(s)) } },
+
+  # --- validate.c: likewise ---
+  ->(s) { Oj::Parser.new(:validate).parse(s) },
+  ->(s) { Oj::Parser.new(:validate).file(to_file(s)) },
+
+  # --- parser.c: just_one, load, and the mode setters ---
+  ->(s) {
+    p = Oj::Parser.new(:usual)
+    p.just_one = (s.getbyte(0) || 0).even?
+    p.just_one
+    # Parser#load takes an IO and calls readpartial on it; Parser#parse is the
+    # String entry point.
+    p.load(StringIO.new(s))
+  },
+  ->(s) { Oj::Parser.new(:saj).tap { |x| x.handler = H_PLAIN }.load(StringIO.new(s)) },
+
+  # --- trace.c: the trace hooks ---
+  ->(s) { silenced { Oj.load(s, mode: :object, trace: true) } },
+  ->(s) { silenced { Oj.dump(objs(s).first(4), mode: :object, trace: true) } },
+
+  # --- scp.c noop_* : chosen when the handler responds to nothing ---
+  ->(s) { Oj.sc_parse(Object.new, s) },
+  ->(s) { Oj.sc_parse(Object.new, StringIO.new(s)) },
+
+  # --- reader.c: a real IO, not a StringIO, for the partial-read paths ---
+  ->(s) {
+    r, w = IO.pipe
+    begin
+      w.write(s)
+      w.close
+      Oj.load(r, mode: :strict)
+    ensure
+      r.close unless r.closed?
+      w.close unless w.closed?
+    end
+  },
+  ->(s) {
+    r, w = IO.pipe
+    begin
+      w.write(s)
+      w.close
+      Oj.sc_parse(H, r)
+    ensure
+      r.close unless r.closed?
+      w.close unless w.closed?
+    end
+  },
+
+  # --- odd.c: register_odd / register_odd_raw ---
+  ->(s) {
+    c = Struct.new(:v)
+    Oj.register_odd(c, c, :new, :v)
+    Oj.load(Oj.dump(c.new(s), mode: :object), mode: :object)
+  },
+  ->(s) {
+    c = Struct.new(:v)
+    Oj.register_odd_raw(c, c, :new, :v)
+    Oj.dump(c.new(%({"raw":#{s.bytesize}})), mode: :object)
+  },
+
+  # --- mem.c ---
+  ->(s) { silenced { Oj.mem_report } },
+
+  # --- rxclass.c: reached only through the :match_string option ---
+  ->(s) {
+    t = s.dup.force_encoding(Encoding::UTF_8).scrub("")
+    rx = { /^tim/ => Time, Regexp.new(Regexp.escape(t[0, 6].to_s)) => String }
+    Oj.load(s, mode: :compat, match_string: rx)
+  },
+  ->(s) {
+    rx = { /./ => String, /\A\d+\z/ => Integer }
+    Oj.load(s, mode: :custom, match_string: rx, create_additions: true)
+  },
+
+  # --- GC callbacks: mark_doc / mark_leaf / compact_doc / compact_leaf /
+  #     free_doc_cb / string_writer_mark only run under GC, so force it while
+  #     the objects are still live.
+  ->(s) {
+    d = Oj::Doc.open(s) { |x| x }
+    w = Oj::StringWriter.new
+    w.push_object
+    w.push_value(s, "k")
+    GC.start
+    GC.compact if GC.respond_to?(:compact)
+    w.pop_all
+    d
+  },
+  ->(s) {
+    doc = Oj::Doc.open(s)
+    doc.size
+    GC.start
+    doc.close
+  },
+
+  # --- string_writer.c: reset / as_json / the unwrap path ---
+  ->(s) {
+    w = Oj::StringWriter.new(indent: "  ")
+    w.push_object
+    w.push_value(s, "k")
+    w.pop_all
+    a = w.to_s
+    w.reset if w.respond_to?(:reset)
+    b = (w.as_json if w.respond_to?(:as_json))
+    [a, b]
+  },
+
+  # --- dump.c: the per-type dumpers ---
+  ->(s) {
+    n = s.getbyte(0) || 0
+    fmt = %i[unix unix_zone xmlschema ruby][n & 3]
+    dump_all([Time.at(0), Time.now, Time.at(1 << 33)],
+             mode: :custom, time_format: fmt, create_id: "^o")
+  },
+  ->(s) { dump_all([String, Hash, Oj, FzObj, Comparable], mode: :object) },
+  ->(s) { Oj.dump(FzRaw.new(s), mode: :compat) },
+  ->(s) { dump_all([Float::NAN, Float::INFINITY, -Float::INFINITY], mode: %i[strict null compat rails][(s.getbyte(0) || 0) & 3]) },
+  ->(s) { Oj.dump({ s => 1, "b" => nil, "c" => 2 }, mode: :compat, omit_nil: true, omit_null_byte: true) },
+
+  # --- custom.c *_dump / *_load pairs, per object so one failure is contained ---
+  ->(s) {
+    n = s.getbyte(0) || 0
+    o = { mode: :custom, create_id: "^o", create_additions: true,
+          time_format: %i[unix unix_zone xmlschema ruby][n & 3],
+          bigdecimal_as_decimal: n[2] == 1,
+          bigdecimal_load: n[3] == 1 ? :bigdecimal : :float }
+    roundtrip_all(objs(s), o)
+  },
+  ->(s) { Oj.load(s, mode: :custom, create_additions: true, create_id: "^o", bigdecimal_load: :bigdecimal) },
+
+  # --- usual.c: create_id / symbol keys / the decimal-mode key variants ---
+  ->(s) {
+    n = s.getbyte(0) || 0
+    p = Oj::Parser.new(:usual)
+    p.create_id = "^o"
+    p.class_cache = n[0] == 1
+    p.ignore_json_create = n[1] == 1
+    p.symbol_keys = n[2] == 1
+    p.decimal = %i[auto ruby bigdecimal float][(n >> 3) & 3]
+    p.missing_class = n[4] == 1 ? :auto : :ignore
+    p.parse(s)
+  },
+  ->(s) {
+    # documents whose keys are numbers of every width, for the
+    # add_float_as_big_key / add_big_as_float_key / add_big_as_ruby_key trio
+    n = s.getbyte(0) || 0
+    doc = %({"a":1.5,"b":123456789012345678901234567890,"c":1e400,"d":#{"9" * 40},"e":0.1})
+    p = Oj::Parser.new(:usual)
+    p.decimal = %i[auto ruby bigdecimal float][n & 3]
+    [p.parse(doc), p.parse(s)]
+  },
+  ->(s) {
+    n = s.getbyte(0) || 0
+    Oj.load(%({"^o":"FzObj","s":"x"}), mode: :object, create_id: "^o",
+            class_cache: n[0] == 1, auto_define: n[1] == 1) rescue nil
+    Oj.load(s, mode: :object, create_id: "^o", auto_define: n[1] == 1)
+  },
 
   # --- round trips ---
   ->(s) { Oj.dump(Oj.load(s, mode: :strict), mode: :strict) },
